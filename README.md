@@ -5,4 +5,5 @@ Members:
 
 How to run the code:
 1. Build the nlp-class env in bash(or Mac)
-2. Run as Instructions presented
+2. Execute env and cd the /code folder
+3. Run as Instructions presented
