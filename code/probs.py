@@ -270,6 +270,31 @@ class LanguageModel:
         if self.progress % freq == 1:
             sys.stderr.write(".")
 
+    def sample(self, max_length: int = 20) -> list[str]:
+        """Sample one sentence from the model."""
+        x, y = BOS, BOS
+        sentence: list[str] = []
+
+        for _ in range(max_length):
+            # 构建分布
+            probs = torch.tensor([self.prob(x, y, z) for z in self.vocab], dtype=torch.float)
+
+            # 按分布采样一个 z
+            z_idx = torch.multinomial(probs, 1).item()
+            z = list(self.vocab)[z_idx]
+
+            if z == EOS:  # 到句尾了
+                break
+            if z != BOS:  # BOS 只是上下文，不输出
+                sentence.append(z)
+
+            # 更新上下文
+            x, y = y, z
+
+        if len(sentence) == max_length:  # 超长截断
+            sentence.append("...")
+        return sentence
+
 
 ##### SPECIFIC FAMILIES OF LANGUAGE MODELS
 
@@ -323,11 +348,27 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
         super().__init__(vocab, lambda_)
 
     def prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
-        # TODO: Reimplement me so that I do backoff
-        return super().prob(x, y, z)
-        # Don't forget the difference between the Wordtype z and the
-        # 1-element tuple (z,). If you're looking up counts,
-        # these will have very different counts!
+        V   = self.vocab_size
+        lam = self.lambda_
+
+        # ---- Case 1: trigram level ----
+        if self.context_count[(x, y)] > 0:
+            return ((self.event_count[(x, y, z)] + lam) /
+                    (self.context_count[(x, y)] + lam * V))
+
+        # ---- Case 2: back off to bigram ----
+        if self.context_count[(y,)] > 0:
+            return ((self.event_count[(y, z)] + lam) /
+                    (self.context_count[(y,)] + lam * V))
+
+        # ---- Case 3: back off to unigram ----
+        if self.context_count[()] > 0:
+            return ((self.event_count[(z,)] + lam) /
+                    (self.context_count[()] + lam * V))
+
+        # ---- Case 4: final fallback: uniform ----
+        return 1.0 / V
+
 
 
 class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
@@ -340,8 +381,21 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         self.l2: float = l2
 
         # TODO: ADD CODE TO READ THE LEXICON OF WORD VECTORS AND STORE IT IN A USEFUL FORMAT.
-        self.dim: int = 99999999999  # TODO: SET THIS TO THE DIMENSIONALITY OF THE VECTORS
-
+        self.word2idx = {w: i for i, w in enumerate(vocab)}
+        word_vecs = {}
+        with open(lexicon_file) as f:
+            for line in f:
+                parts = line.strip().split()
+                word, vec = parts[0], list(map(float, parts[1:]))
+                word_vecs[word] = torch.tensor(vec, dtype=torch.float)
+        self.dim: int = len(next(iter(word_vecs.values()))) # TODO: SET THIS TO THE DIMENSIONALITY OF THE VECTORS
+        E = []
+        for w in vocab:
+            if w in word_vecs:
+                E.append(word_vecs[w])
+            else:
+                E.append(word_vecs[OOL])  # 不在词典里 → OOL 向量
+        self.embeddings = torch.stack(E)  # [|V|, dim]
         # We wrap the following matrices in nn.Parameter objects.
         # This lets PyTorch know that these are parameters of the model
         # that should be listed in self.parameters() and will be
@@ -353,6 +407,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         self.X = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
         self.Y = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
 
+        self.epochs = epochs             
     def log_prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
         """Return log p(z | xy) according to this language model."""
         # https://pytorch.org/docs/stable/generated/torch.Tensor.item.html
@@ -370,6 +425,10 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # it from the class's general `log_prob` method.)
 
         # TODO: IMPLEMENT ME!
+        logits = self.logits(x, y)  # [|V|]
+        log_probs = torch.log_softmax(logits, dim=0)  # 归一化
+        return log_probs[self.word2idx[z]]
+
         # This method should call the logits helper method.
         # You are free to define other helper methods too.
         #
@@ -381,7 +440,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # The return type, TorchScalar, represents a torch.Tensor scalar.
         # See Question 7 in INSTRUCTIONS.md for more info about fine-grained 
         # type annotations for Tensors.
-        raise NotImplementedError("Implement me!")
+        #raise NotImplementedError("Implement me!")
 
     def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor,"vocab"]:
         """Return a vector of the logs of the unnormalized probabilities f(xyz) * θ 
@@ -389,6 +448,12 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         These are commonly known as "logits" or "log-odds": the values that you 
         exponentiate and renormalize in order to get a probability distribution."""
         # TODO: IMPLEMENT ME!
+        ex = self.embeddings[self.word2idx[x]]  # [dim]
+        ey = self.embeddings[self.word2idx[y]]  # [dim]
+        context = self.X @ ex + self.Y @ ey  # [dim]
+        logits = self.embeddings @ context  # [|V|]
+        return logits
+
         # Don't forget that you can create additional methods
         # that you think are useful, if you'd like.
         # It's cleaner than making this function massive.
@@ -406,7 +471,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # vocabulary, and "embedding" will be replaced by the embedding
         # dimensionality as given by the lexicon.  See
         # https://www.cs.jhu.edu/~jason/465/hw-lm/code/INSTRUCTIONS.html#a-note-on-type-annotations
-        raise NotImplementedError("Implement me!")
+        #raise NotImplementedError("Implement me!")
 
     def train(self, file: Path):    # type: ignore
         
@@ -433,6 +498,22 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
 
         #####################
         # TODO: Implement your SGD here by taking gradient steps on a sequence
+        for epoch in range(self.epochs):
+            total_F = 0.0
+            for (x, y, z) in read_trigrams(file, self.vocab):
+                optimizer.zero_grad()
+                logp = self.log_prob_tensor(x, y, z)
+                # 正则项
+                reg = self.l2 * (torch.sum(self.X ** 2) + torch.sum(self.Y ** 2))
+                # 目标 F_i
+                F_i = logp - reg
+                # PyTorch 最小化 loss → 取 -F_i
+                loss = -F_i
+                loss.backward()
+                optimizer.step()
+                total_F += F_i.item()
+                self.show_progress()
+            print(f"epoch {epoch + 1}: F = {total_F / N}")
         # of training examples.  Here's how to use PyTorch to make it easy:
         #
         # To get the training examples, you can use the `read_trigrams` function
