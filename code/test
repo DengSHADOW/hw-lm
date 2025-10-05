@@ -1,0 +1,5 @@
+from pathlib import Path
+
+modelName = Path('abc/gen.txt')
+modelName = modelName.parent.name
+print(modelName)
